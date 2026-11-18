@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -27,9 +28,35 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
 
 from .db import Conflict, Store
+from .readsupport import (
+    MAX_INTERVAL_SPAN,
+    MAX_RECORDS,
+    MIN_BASE_QUALITY,
+    MIN_MAPPING_QUALITY,
+    BamError,
+    collect_support,
+)
 from .vcfbuild import GZ_NAME, VCFError, validate_and_build
 
-DEFAULT_MAX_UPLOAD = 10 * 1024 * 1024  # 10 MiB
+DEFAULT_MAX_UPLOAD = 10 * 1024 * 1024        # 10 MiB (VCF)
+DEFAULT_MAX_READS_UPLOAD = 20 * 1024 * 1024  # 20 MiB (BAM + BAI combined)
+
+
+def _fetch_records(gz_path: str, chrom: str, start: int, end: int) -> list:
+    """Raw VCF lines whose reference span intersects [start, end] (1-based)."""
+    tb = pysam.TabixFile(gz_path)
+    try:
+        records = []
+        # 1-based closed [start, end] -> 0-based half-open fetch.
+        for ln in tb.fetch(chrom, start - 1, end):
+            f = ln.split("\t", 4)
+            pos = int(f[1])
+            # Exact span check on top of the index iterator.
+            if pos <= end and pos + len(f[3]) - 1 >= start:
+                records.append(ln)
+        return records
+    finally:
+        tb.close()
 
 
 @dataclass
@@ -37,6 +64,7 @@ class Config:
     data_dir: str
     instance_id: str
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD
+    max_reads_upload_bytes: int = DEFAULT_MAX_READS_UPLOAD
     reaper_interval: float = 2.0      # seconds between reaper runs (0 disables)
     heartbeat_interval: float = 2.0   # seconds between heartbeats (0 disables)
     dead_after: float = 15.0          # instance considered dead after this silence
@@ -49,6 +77,9 @@ def _config_from_env() -> Config:
         data_dir=e.get("VCF_DATA_DIR", "/data"),
         instance_id=e.get("VCF_INSTANCE_ID") or uuid.uuid4().hex,
         max_upload_bytes=int(e.get("VCF_MAX_UPLOAD_BYTES", DEFAULT_MAX_UPLOAD)),
+        max_reads_upload_bytes=int(
+            e.get("VCF_MAX_READS_UPLOAD_BYTES", DEFAULT_MAX_READS_UPLOAD)
+        ),
         reaper_interval=float(e.get("VCF_REAPER_INTERVAL", "2")),
         heartbeat_interval=float(e.get("VCF_HEARTBEAT_INTERVAL", "2")),
         dead_after=float(e.get("VCF_DEAD_AFTER", "15")),
@@ -144,7 +175,10 @@ def create_app(config: Config | None = None) -> FastAPI:
             "Tabix-indexed. Query 1-based closed intervals; every record whose "
             "reference span [POS, POS+len(REF)-1] intersects the interval is "
             "returned via the index. Uploads are optimistic-concurrency "
-            "controlled through `base_version`."
+            "controlled through `base_version`. `/read-support` cross-checks "
+            "published single-base substitutions against an uploaded sorted "
+            "BAM+BAI (max 20 MiB total) over an interval of at most 2000 "
+            "bases covering at most 20 records."
         ),
     )
     app.state.cfg = cfg
@@ -222,21 +256,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 )
             gz_path = os.path.join(cfg.data_dir, rel, GZ_NAME)
             try:
-                tb = pysam.TabixFile(gz_path)
-                try:
-                    # 1-based closed [start, end] -> 0-based half-open fetch.
-                    lines = tb.fetch(vchrom, start - 1, end)
-                    records = []
-                    for ln in lines:
-                        f = ln.split("\t", 4)
-                        pos = int(f[1])
-                        # Exact span check on top of the index iterator.
-                        if pos <= end and pos + len(f[3]) - 1 >= start:
-                            records.append(ln)
-                finally:
-                    tb.close()
-            except HTTPException:
-                raise
+                records = _fetch_records(gz_path, vchrom, start, end)
             except Exception as exc:
                 raise HTTPException(500, f"indexed fetch failed: {exc}")
             return {
@@ -249,6 +269,107 @@ def create_app(config: Config | None = None) -> FastAPI:
             }
         finally:
             store.unpin(ref_id)
+
+    def _read_support_sync(chrom: str, start: int, end: int, bam_path: str):
+        """Pin the current version, fetch its records, run the pileup counts.
+
+        Runs in a worker thread: the pin only delays reclamation of the
+        pinned version, never the publication of a new one, so uploads and
+        interval queries proceed while statistics are computed.
+        """
+        pinned = store.pin(cfg.instance_id, time.time())
+        if pinned is None:
+            raise HTTPException(404, "no VCF has been published yet")
+        version, vchrom, rel, ref_id = pinned
+        try:
+            if chrom != vchrom:
+                raise HTTPException(
+                    400, f"the published dataset contains chromosome '{vchrom}' only"
+                )
+            gz_path = os.path.join(cfg.data_dir, rel, GZ_NAME)
+            try:
+                lines = _fetch_records(gz_path, vchrom, start, end)
+            except Exception as exc:
+                raise HTTPException(500, f"indexed fetch failed: {exc}")
+            if len(lines) > MAX_RECORDS:
+                raise HTTPException(
+                    400,
+                    f"interval intersects {len(lines)} VCF records; "
+                    f"the limit is {MAX_RECORDS}",
+                )
+            records = []
+            for ln in lines:
+                f = ln.split("\t")
+                records.append((int(f[1]), f[3], f[4], ln))
+            try:
+                results = collect_support(bam_path, vchrom, records)
+            except BamError as exc:
+                raise HTTPException(400, str(exc))
+            return {
+                "version": version,
+                "chrom": vchrom,
+                "start": start,
+                "end": end,
+                "n_records": len(results),
+                "criteria": {
+                    "min_mapping_quality": MIN_MAPPING_QUALITY,
+                    "min_base_quality": MIN_BASE_QUALITY,
+                    "excluded": [
+                        "duplicate",
+                        "secondary",
+                        "supplementary",
+                        "deletion-at-site",
+                        "refskip-at-site",
+                    ],
+                    "pair_overlap": (
+                        "both ends covering the site count as one molecule; "
+                        "qualified conflicts are listed and not counted"
+                    ),
+                },
+                "results": results,
+            }
+        finally:
+            store.unpin(ref_id)
+
+    @app.post("/read-support")
+    async def read_support(
+        bam: UploadFile = File(..., description="Coordinate-sorted BAM"),
+        bai: UploadFile = File(..., description="BAI index for the BAM"),
+        chrom: str = Query(..., description="Chromosome name as in the VCF"),
+        start: int = Query(..., ge=1, description="1-based interval start (inclusive)"),
+        end: int = Query(..., ge=1, description="1-based interval end (inclusive)"),
+    ):
+        if end < start:
+            raise HTTPException(400, "end must be >= start")
+        span = end - start + 1
+        if span > MAX_INTERVAL_SPAN:
+            raise HTTPException(
+                400,
+                f"interval spans {span} bases; the limit is {MAX_INTERVAL_SPAN}",
+            )
+        tmpdir = tempfile.mkdtemp(prefix=f"reads-{cfg.instance_id}-")
+        try:
+            bam_path = os.path.join(tmpdir, "reads.bam")
+            total = 0
+            for upload, path in ((bam, bam_path), (bai, bam_path + ".bai")):
+                with open(path, "wb") as out:
+                    while True:
+                        chunk = await upload.read(1 << 20)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > cfg.max_reads_upload_bytes:
+                            raise HTTPException(
+                                413,
+                                "BAM+BAI exceed the "
+                                f"{cfg.max_reads_upload_bytes}-byte limit",
+                            )
+                        out.write(chunk)
+            return await asyncio.to_thread(
+                _read_support_sync, chrom, start, end, bam_path
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     @app.get("/version")
     def get_version():

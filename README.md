@@ -2,7 +2,10 @@
 
 FastAPI + pysam + SQLite service for uploading single-chromosome VCF files and
 querying them by 1-based closed chromosome intervals, with atomic versioned
-replacement and safe concurrent access from two app instances.
+replacement and safe concurrent access from two app instances. A
+`/read-support` endpoint cross-checks published single-base substitutions
+against an uploaded BAM to flag suspected false positives. Interactive API
+docs (Swagger UI) are served at `/docs` on every instance.
 
 ## Run
 
@@ -49,6 +52,54 @@ the duration of the query, so version, data and index always match.
 
 Current published version, chromosome and record count.
 
+### `POST /read-support?chrom=<c>&start=<s>&end=<e>` (multipart file fields `bam`, `bai`)
+
+Cross-checks the published records against raw aligned reads, for QC of
+suspected false-positive calls.
+
+- `chrom` must be the published chromosome; `start`/`end` are a 1-based
+  **closed** interval spanning at most **2000 bases**.
+- `bam` is a coordinate-sorted BAM, `bai` its index; **at most 20 MiB
+  combined** (`413` beyond that).
+- The interval must intersect at most **20 published records** (`400`
+  otherwise); records are fetched through the same Tabix index as
+  `GET /variants`.
+- An unreadable BAM/BAI, a non-coordinate-sorted BAM, or a BAM that does not
+  contain the chromosome fails the whole request with `400`.
+
+For every intersected record the response carries the original record line
+and the pinned `version` it was read from. Single-base substitutions get
+molecule counts:
+
+```json
+{
+  "version": 1, "chrom": "chr1", "start": 100, "end": 110, "n_records": 2,
+  "criteria": {"min_mapping_quality": 20, "min_base_quality": 20, "...": "..."},
+  "results": [
+    {"record": "chr1\t105\t.\tG\tT\t.\t.\t.", "pos": 105, "ref": "G", "alt": "T",
+     "applicable": true,
+     "support": {"ref": 5, "alt": 3, "other": 1},
+     "other_bases": {"C": 1},
+     "conflicts": [{"qname": "pairX", "bases": ["A", "T"]}]},
+    {"record": "chr1\t100\t.\tACGT\tA\t.\t.\t.", "pos": 100, "ref": "ACGT",
+     "alt": "A", "applicable": false, "reason": "not a single-base substitution"}
+  ]
+}
+```
+
+Counting rules: only read ends with mapping quality ≥ 20 and base quality
+≥ 20 at the site count; duplicate, secondary and supplementary alignments
+and positions deleted/skipped in the read (CIGAR `D`/`N`) are excluded;
+non-`ACGT` calls support nothing. Both ends of a read pair covering the
+site are one molecule: agreement counts once, qualified disagreement is
+listed under `conflicts` and counts for nothing. Non-SNV records are
+marked `applicable: false` individually.
+
+The pileup runs in a worker thread while holding only a read pin on the
+version it describes, so a slow `/read-support` job never blocks uploads
+(correcting the variant list) or `GET /variants` queries; the response
+still reports the fixed version the statistics belong to.
+
 ## Consistency design
 
 - **Atomic publish**: a new version is fully built (sorted, compressed,
@@ -71,10 +122,10 @@ Current published version, chromosome and record count.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest tests/          # 36 tests
+python -m pytest tests/          # 56 tests
 uvicorn --factory app.main:create_app   # single dev instance (uses /data or $VCF_DATA_DIR)
 ```
 
 Configuration via environment: `VCF_DATA_DIR`, `VCF_INSTANCE_ID`,
-`VCF_MAX_UPLOAD_BYTES`, `VCF_REAPER_INTERVAL`, `VCF_HEARTBEAT_INTERVAL`,
-`VCF_DEAD_AFTER`, `VCF_ORPHAN_GRACE`.
+`VCF_MAX_UPLOAD_BYTES`, `VCF_MAX_READS_UPLOAD_BYTES`, `VCF_REAPER_INTERVAL`,
+`VCF_HEARTBEAT_INTERVAL`, `VCF_DEAD_AFTER`, `VCF_ORPHAN_GRACE`.
